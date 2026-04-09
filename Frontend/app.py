@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-BASE_URL  = "http://127.0.0.1:8000"
+BASE_URL  = "http://localhost:8000"
 # Backend fires ~11 TMDB calls in parallel — give it up to 30 s.
 # The old 8 s was shorter than needed, causing the timeout error.
 TIMEOUT   = 30
