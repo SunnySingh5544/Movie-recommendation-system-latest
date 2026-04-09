@@ -1,359 +1,273 @@
-import streamlit as st
-import requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import asyncio
+import pandas as pd
+import pickle
+import numpy as np
+import httpx
+import os
+from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
 
-BASE_URL  = "http://localhost:8000"
-# Backend fires ~11 TMDB calls in parallel — give it up to 30 s.
-# The old 8 s was shorter than needed, causing the timeout error.
-TIMEOUT   = 30
-TMDB_IMG  = "https://image.tmdb.org/t/p/w500"
-TMDB_IMG_ORIG = "https://image.tmdb.org/t/p/original"
+# =========================
+# ENV
+# =========================
+load_dotenv()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+BASE_URL = "https://api.themoviedb.org/3"
+IMG_URL  = "https://image.tmdb.org/t/p/w500"
 
-# ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="CineMatch",
-    page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="collapsed",
+# =========================
+# SHARED HTTP CLIENT
+# =========================
+http_client: httpx.AsyncClient = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    yield
+    await http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap');
+# =========================
+# LOAD YOUR 3 MODEL FILES
+# =========================
+print("Loading model files...")
 
-/* ---- reset / base ---- */
-html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-    background: #0a0a0f;
-    color: #e8e4dc;
-}
-.block-container { padding: 2rem 3rem 4rem; max-width: 1400px; }
+# 1. df.pkl — your movies dataframe (CSV format)
+try:
+    df = pd.read_csv("df.pkl")
+    # Normalize title column name
+    df.columns = [c.strip().lower() for c in df.columns]
+    print(f"✅ df.pkl → {len(df)} rows | columns: {list(df.columns)}")
+except Exception as e:
+    print(f"❌ df.pkl failed: {e}")
+    df = pd.DataFrame({"title": []})
 
-/* ---- hero title ---- */
-.hero-title {
-    font-family: 'Bebas Neue', sans-serif;
-    font-size: clamp(3rem, 8vw, 6rem);
-    letter-spacing: 0.08em;
-    background: linear-gradient(135deg, #f5c518 0%, #ff6b35 60%, #c2185b 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    line-height: 1;
-    margin-bottom: 0.2rem;
-}
-.hero-sub {
-    font-size: 0.95rem;
-    color: #888;
-    letter-spacing: 0.25em;
-    text-transform: uppercase;
-    margin-bottom: 2.5rem;
-}
+# 2. tfidf_matrix.pkl — sparse TF-IDF matrix (rows = movies, cols = words)
+try:
+    with open("tfidf_matrix.pkl", "rb") as f:
+        tfidf_matrix = pickle.load(f)
+    print(f"✅ tfidf_matrix.pkl → shape: {tfidf_matrix.shape}")
+except Exception as e:
+    print(f"❌ tfidf_matrix.pkl failed: {e}")
+    tfidf_matrix = None
 
-/* ---- search bar ---- */
-div[data-testid="stTextInput"] input {
-    background: #16161f !important;
-    border: 1.5px solid #2a2a3a !important;
-    border-radius: 50px !important;
-    color: #e8e4dc !important;
-    font-size: 1rem !important;
-    padding: 0.75rem 1.5rem !important;
-    transition: border-color 0.2s;
-}
-div[data-testid="stTextInput"] input:focus {
-    border-color: #f5c518 !important;
-    box-shadow: 0 0 0 3px rgba(245,197,24,0.15) !important;
-}
+# 3. indices.pkl — maps movie title → integer row index in tfidf_matrix
+try:
+    with open("indices.pkl", "rb") as f:
+        indices = pickle.load(f)
+    # Convert to dict for fast O(1) lookup regardless of original type
+    if hasattr(indices, "to_dict"):
+        indices_dict = {str(k).lower().strip(): int(v) for k, v in indices.items()}
+    elif isinstance(indices, dict):
+        indices_dict = {str(k).lower().strip(): int(v) for k, v in indices.items()}
+    else:
+        indices_dict = {}
+    print(f"✅ indices.pkl → {len(indices_dict)} entries")
+except Exception as e:
+    print(f"❌ indices.pkl failed: {e}")
+    indices_dict = {}
 
-/* ---- section headings ---- */
-.section-heading {
-    font-family: 'Bebas Neue', sans-serif;
-    font-size: 1.8rem;
-    letter-spacing: 0.1em;
-    color: #f5c518;
-    margin: 2.5rem 0 1rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-.section-heading::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: linear-gradient(to right, #f5c518 0%, transparent 80%);
-    margin-left: 0.75rem;
-}
+# Detect title column in df
+TITLE_COL = next(
+    (c for c in df.columns if "title" in c.lower()),
+    df.columns[0] if len(df.columns) > 0 else "title"
+)
 
-/* ---- movie card ---- */
-.movie-card {
-    position: relative;
-    border-radius: 12px;
-    overflow: hidden;
-    background: #12121a;
-    transition: transform 0.25s ease, box-shadow 0.25s ease;
-    cursor: pointer;
-}
-.movie-card:hover {
-    transform: translateY(-6px) scale(1.02);
-    box-shadow: 0 20px 40px rgba(0,0,0,0.7), 0 0 0 1px rgba(245,197,24,0.25);
-}
-.movie-card img {
-    width: 100%;
-    display: block;
-    aspect-ratio: 2/3;
-    object-fit: cover;
-}
-.movie-card-label {
-    padding: 0.6rem 0.75rem;
-    font-size: 0.78rem;
-    font-weight: 500;
-    color: #ccc;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    background: #12121a;
-}
-.movie-card-badge {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    background: rgba(245,197,24,0.9);
-    color: #000;
-    font-size: 0.65rem;
-    font-weight: 700;
-    padding: 2px 7px;
-    border-radius: 20px;
-    letter-spacing: 0.05em;
-}
-
-/* ---- detail panel ---- */
-.detail-panel {
-    background: linear-gradient(135deg, #14141e 0%, #1a1225 100%);
-    border: 1px solid #2a2a3a;
-    border-radius: 16px;
-    padding: 2rem;
-    margin: 1.5rem 0;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-}
-.detail-title {
-    font-family: 'Bebas Neue', sans-serif;
-    font-size: 2.8rem;
-    letter-spacing: 0.06em;
-    color: #f5c518;
-    line-height: 1.1;
-}
-.detail-meta {
-    font-size: 0.82rem;
-    color: #888;
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-    margin: 0.4rem 0 1rem;
-}
-.detail-overview {
-    font-size: 0.97rem;
-    line-height: 1.7;
-    color: #c8c4bc;
-    margin-top: 0.75rem;
-}
-.genre-pill {
-    display: inline-block;
-    background: rgba(245,197,24,0.1);
-    border: 1px solid rgba(245,197,24,0.3);
-    color: #f5c518;
-    font-size: 0.72rem;
-    font-weight: 500;
-    padding: 3px 10px;
-    border-radius: 20px;
-    margin: 2px 3px 2px 0;
-    letter-spacing: 0.08em;
-}
-.rating-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: rgba(245,197,24,0.15);
-    border: 1px solid rgba(245,197,24,0.4);
-    color: #f5c518;
-    font-size: 1rem;
-    font-weight: 700;
-    padding: 4px 12px;
-    border-radius: 8px;
-}
-
-/* ---- poster image ---- */
-.poster-img {
-    border-radius: 12px;
-    box-shadow: -8px 8px 32px rgba(0,0,0,0.7);
-    width: 100%;
-}
-
-/* ---- no poster placeholder ---- */
-.no-poster {
-    background: #1a1a28;
-    border: 1px dashed #333;
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 300px;
-    color: #555;
-    font-size: 0.85rem;
-}
-
-/* ---- error / warning ---- */
-div[data-testid="stAlert"] {
-    border-radius: 10px !important;
-}
-
-/* ---- scrollbar ---- */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #0a0a0f; }
-::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
-</style>
-""", unsafe_allow_html=True)
+# Detect movie_id column in df (optional — used for direct TMDB lookup)
+ID_COL = next(
+    (c for c in df.columns if c in ["movie_id", "id", "tmdb_id", "movieid"]),
+    None
+)
+print(f"📋 Using → title_col='{TITLE_COL}'  id_col='{ID_COL}'")
 
 
-# ── Helper: render a movie grid ───────────────────────────────────────────────
-def render_movie_grid(movies, cols=5, badge_text=None):
-    """
-    Expects each movie dict to have at least:
-        title, poster_path  (relative TMDB path, e.g. /abc.jpg)
-    OR  poster_url          (full URL)
-    """
-    columns = st.columns(cols)
-    for i, movie in enumerate(movies):
-        with columns[i % cols]:
-            poster = movie.get("poster_url") or (
-                TMDB_IMG + movie["poster_path"] if movie.get("poster_path") else None
-            )
-            title = movie.get("title", "Unknown")
-            html = '<div class="movie-card">'
-            if poster:
-                html += f'<img src="{poster}" alt="{title}" loading="lazy">'
-            else:
-                html += '<div class="no-poster">No Image</div>'
-            if badge_text:
-                html += f'<span class="movie-card-badge">{badge_text}</span>'
-            html += f'<div class="movie-card-label">{title}</div></div>'
-            st.markdown(html, unsafe_allow_html=True)
+# =========================
+# RECOMMENDER
+# Uses YOUR tfidf_matrix + indices for cosine similarity
+# =========================
+def recommend(title: str) -> list[dict]:
+    if tfidf_matrix is None:
+        print("⚠️ tfidf_matrix not loaded, skipping recommendations")
+        return []
+
+    key = title.lower().strip()
+
+    # Exact match first
+    idx = indices_dict.get(key)
+
+    # Fuzzy fallback — find closest title in df
+    if idx is None:
+        matches = df[df[TITLE_COL].str.lower().str.contains(key, na=False, regex=False)]
+        if matches.empty:
+            print(f"⚠️ '{title}' not found in indices or df")
+            return []
+        fallback_title = matches.iloc[0][TITLE_COL]
+        idx = indices_dict.get(fallback_title.lower().strip())
+        if idx is None:
+            print(f"⚠️ '{fallback_title}' found in df but not in indices")
+            return []
+
+    # Compute cosine similarity between this movie and all others
+    movie_vector = tfidf_matrix[idx]
+    scores = cosine_similarity(movie_vector, tfidf_matrix).flatten()
+
+    # Sort descending, skip index 0 (the movie itself), take top 10
+    top_indices = np.argsort(scores)[::-1]
+    top_indices = [i for i in top_indices if i != idx][:10]
+
+    results = []
+    for i in top_indices:
+        row  = df.iloc[i]
+        mid  = row[ID_COL] if ID_COL and pd.notna(row.get(ID_COL)) else None
+        results.append({
+            "title":    row[TITLE_COL],
+            "movie_id": int(mid) if mid is not None else None,
+            "score":    round(float(scores[i]), 4),
+        })
+
+    print(f"🎬 Top recs for '{title}': {[r['title'] for r in results]}")
+    return results
 
 
-# ── HEADER ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="hero-title">CineMatch</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Discover · Explore · Obsess</div>', unsafe_allow_html=True)
-
-# ── SEARCH ────────────────────────────────────────────────────────────────────
-query = st.text_input("", placeholder="🔍  Search for a movie…", label_visibility="collapsed")
-
-# ── SEARCH RESULTS ────────────────────────────────────────────────────────────
-if query:
-    with st.spinner("Fetching results…"):
-        try:
-            res = requests.get(f"{BASE_URL}/movie/search", params={"query": query}, timeout=TIMEOUT)
-
-            if res.status_code != 200:
-                st.error("Backend returned an error ❌")
-            else:
-                data = res.json()
-
-                if "error" in data:
-                    st.warning("No movie found for that search. Try a different title.")
-                else:
-                    movie = data["movie_details"]
-
-                    # ── Detail panel ──────────────────────────────────────────
-                    st.markdown('<div class="section-heading">🎬 Movie Details</div>',
-                                unsafe_allow_html=True)
-
-                    left, right = st.columns([1, 2.8], gap="large")
-
-                    with left:
-                        poster_url = movie.get("poster_url") or (
-                            TMDB_IMG + movie["poster_path"] if movie.get("poster_path") else None
-                        )
-                        if poster_url:
-                            st.markdown(
-                                f'<img class="poster-img" src="{poster_url}" alt="{movie["title"]}">',
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.markdown('<div class="no-poster">No Poster Available</div>',
-                                        unsafe_allow_html=True)
-
-                    with right:
-                        rating = movie.get("vote_average")
-                        release = movie.get("release_date", "")[:4] if movie.get("release_date") else ""
-                        runtime = movie.get("runtime")
-                        genres = movie.get("genres", [])  # list of strings
-
-                        st.markdown(
-                            f'<div class="detail-title">{movie["title"]}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        meta_parts = [p for p in [release, f"{runtime} min" if runtime else None] if p]
-                        st.markdown(
-                            f'<div class="detail-meta">{" · ".join(meta_parts)}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        if rating:
-                            st.markdown(
-                                f'<span class="rating-badge">⭐ {rating:.1f} / 10</span>',
-                                unsafe_allow_html=True,
-                            )
-
-                        if genres:
-                            pills = "".join(
-                                f'<span class="genre-pill">{g}</span>' for g in genres
-                            )
-                            st.markdown(f"<div style='margin:0.75rem 0'>{pills}</div>",
-                                        unsafe_allow_html=True)
-
-                        overview = movie.get("overview", "")
-                        if overview:
-                            st.markdown(
-                                f'<div class="detail-overview">{overview}</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                    # ── Recommendations ───────────────────────────────────────
-                    recs = data.get("recommendations", [])
-                    if recs:
-                        st.markdown(
-                            '<div class="section-heading">✨ You Might Also Like</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        # Normalise: backend may return strings OR dicts
-                        normalised = []
-                        for item in recs:
-                            if isinstance(item, str):
-                                # Only a name came back — show as card without image
-                                normalised.append({"title": item, "poster_path": None})
-                            elif isinstance(item, dict):
-                                normalised.append(item)
-
-                        render_movie_grid(normalised, cols=5)
-
-        except requests.exceptions.ConnectionError:
-            st.error("Cannot reach the backend. Make sure it's running on port 8000 ❌")
-        except Exception as e:
-            st.error(f"Unexpected error: {e}")
-
-# ── TRENDING (shown when no search is active) ─────────────────────────────────
-if not query:
-    st.markdown('<div class="section-heading">🔥 Trending Now</div>', unsafe_allow_html=True)
-
+# =========================
+# TMDB HELPERS
+# =========================
+async def tmdb_get(path: str, params: dict = {}) -> dict:
     try:
-        res = requests.get(f"{BASE_URL}/home", timeout=TIMEOUT)
-
-        if res.status_code == 200:
-            trending = res.json()[:10]
-            render_movie_grid(trending, cols=5, badge_text="TRENDING")
-        else:
-            st.error("Failed to load trending movies ❌")
-
-    except requests.exceptions.ConnectionError:
-        st.error("Cannot reach the backend. Make sure it's running on port 8000 ❌")
+        res = await http_client.get(
+            f"{BASE_URL}{path}",
+            params={"api_key": TMDB_API_KEY, **params},
+        )
+        res.raise_for_status()
+        return res.json()
     except Exception as e:
-        st.error(f"Unexpected error: {e}")
+        print(f"TMDB ERROR [{path}]: {e}")
+        return {}
+
+
+async def fetch_by_id(movie_id: int) -> dict:
+    """Direct TMDB lookup by ID — always gets the right poster."""
+    return await tmdb_get(f"/movie/{movie_id}")
+
+
+async def fetch_by_title(title: str) -> dict:
+    """Title search fallback when movie_id is not in df."""
+    data = await tmdb_get("/search/movie", {"query": title})
+    results = data.get("results", [])
+    return results[0] if results else {}
+
+
+def format_movie(m: dict, extra: dict = {}) -> dict:
+    poster_path = m.get("poster_path")
+    return {
+        "title":        m.get("title"),
+        "poster_path":  poster_path,
+        "poster_url":   (IMG_URL + poster_path) if poster_path else None,
+        "vote_average": round(m.get("vote_average") or 0, 1),
+        "release_date": m.get("release_date", ""),
+        **extra,
+    }
+
+
+# =========================
+# ROUTES
+# =========================
+@app.get("/")
+def root():
+    return {"message": "🎬 CineMatch API running"}
+
+
+@app.get("/debug")
+def debug():
+    """Verify all 3 files loaded correctly. Open in browser after starting server."""
+    return {
+        "df_rows":        len(df),
+        "df_columns":     list(df.columns),
+        "title_col":      TITLE_COL,
+        "id_col":         ID_COL,
+        "tfidf_loaded":   tfidf_matrix is not None,
+        "tfidf_shape":    list(tfidf_matrix.shape) if tfidf_matrix is not None else None,
+        "indices_count":  len(indices_dict),
+        "sample_titles":  df[TITLE_COL].head(5).tolist(),
+        "sample_indices": dict(list(indices_dict.items())[:3]),
+    }
+
+
+@app.get("/home")
+async def get_home():
+    """Trending movies for homepage."""
+    data = await tmdb_get("/trending/movie/week")
+    return [format_movie(m) for m in data.get("results", [])[:10]]
+
+
+@app.get("/movie/search")
+async def search(query: str):
+    # 1. Search TMDB for the query
+    search_data = await tmdb_get("/search/movie", {"query": query})
+    results     = search_data.get("results", [])
+
+    if not results:
+        return {"error": "Movie not found"}
+
+    base     = results[0]
+    movie_id = base["id"]
+
+    # 2. Get recommendations using YOUR trained TF-IDF + cosine similarity model
+    recs = recommend(base.get("title", ""))
+
+    # 3. Fire all TMDB calls in parallel:
+    #    - full details for main movie (genres, runtime)
+    #    - poster for each recommendation (by ID if available, else by title)
+    details_task = fetch_by_id(movie_id)
+    rec_tasks = [
+        fetch_by_id(r["movie_id"]) if r["movie_id"]
+        else fetch_by_title(r["title"])
+        for r in recs
+    ]
+
+    all_results = await asyncio.gather(details_task, *rec_tasks)
+    details     = all_results[0]
+    rec_fetched = all_results[1:]
+
+    # 4. Build response
+    movie_details = format_movie(base, extra={
+        "overview": base.get("overview"),
+        "runtime":  details.get("runtime"),
+        "genres":   [g["name"] for g in details.get("genres", [])],
+    })
+
+    recommendations = []
+    for rec, fetched in zip(recs, rec_fetched):
+        if fetched:
+            recommendations.append(format_movie(fetched, extra={
+                "similarity_score": rec["score"]
+            }))
+        else:
+            recommendations.append({
+                "title":            rec["title"],
+                "poster_path":      None,
+                "poster_url":       None,
+                "vote_average":     None,
+                "release_date":     "",
+                "similarity_score": rec["score"],
+            })
+
+    return {
+        "movie_details":   movie_details,
+        "recommendations": recommendations,
+    }
