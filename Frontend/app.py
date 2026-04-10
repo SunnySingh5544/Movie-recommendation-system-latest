@@ -235,9 +235,7 @@ def render_movie_grid(movies, cols=5, badge_text=None):
                 html += f'<span class="movie-card-badge">{badge_text}</span>'
             html += f'<div class="movie-card-label">{title}</div></div>'
             st.markdown(html, unsafe_allow_html=True)
-            if st.button(title, key=f"btn_{i}_{title}", use_container_width=True):
-                st.session_state["search_query"] = title
-                st.rerun()
+           
 
 
 # ── HEADER ────────────────────────────────────────────────────────────────────
