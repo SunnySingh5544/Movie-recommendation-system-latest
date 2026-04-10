@@ -15,6 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+print(f"🔑 TMDB_API_KEY loaded: {'YES → ' + TMDB_API_KEY[:6] + '...' if TMDB_API_KEY else 'NO ❌'}")
 BASE_URL = "https://api.themoviedb.org/3"
 IMG_URL  = "https://image.tmdb.org/t/p/w500"
 

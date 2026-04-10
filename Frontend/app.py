@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-BASE_URL  = "https://movie-recommendation-main-gk4w.onrender.com"
+BASE_URL  = "http://127.0.0.1:8000"
 # Backend fires ~11 TMDB calls in parallel — give it up to 30 s.
 # The old 8 s was shorter than needed, causing the timeout error.
 TIMEOUT   = 30
@@ -242,7 +242,7 @@ st.markdown('<div class="hero-title">CineMatch</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Discover · Explore · Obsess</div>', unsafe_allow_html=True)
 
 # ── SEARCH ────────────────────────────────────────────────────────────────────
-query = st.text_input("", placeholder="🔍  Search for a movie…", label_visibility="collapsed")
+query = st.text_input("Search", placeholder="🔍  Search for a movie…", label_visibility="collapsed")
 
 # ── SEARCH RESULTS ────────────────────────────────────────────────────────────
 if query:
